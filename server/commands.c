@@ -413,12 +413,18 @@ server_run_command(struct client *client, struct config *config,
         goto done;
     }
 
+    /* Assemble the argv for the command we're about to run. */
+    if (help)
+        req_argv = create_argv_help(rule->program, subcommand, helpsubcommand);
+    else
+        req_argv = create_argv_command(rule, &process, argv);
+
     /* Fill up request */
     request = (struct request *) xmalloc(sizeof(struct request));
     request->user = user;
     request->command = xstrdup(command);
     request->subcommand = (subcommand == NULL) ? NULL : xstrdup(subcommand);
-    request->argv = NULL;
+    request->argv = req_argv;
 
     if (!server_config_acl_permit(rule, request)) {
         notice("access denied: user %s, command %s%s%s", user, command,
@@ -444,12 +450,6 @@ server_run_command(struct client *client, struct config *config,
             subcommand = xstrdup(rule->help);
         }
     }
-
-    /* Assemble the argv for the command we're about to run. */
-    if (help)
-        req_argv = create_argv_help(rule->program, subcommand, helpsubcommand);
-    else
-        req_argv = create_argv_command(rule, &process, argv);
 
     /* Now actually execute the program. */
     process.command = command;

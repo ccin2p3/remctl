@@ -31,7 +31,9 @@
 #ifdef HAVE_REGCOMP
 # include <regex.h>
 #endif
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <server/internal.h>
 #include <util/macros.h>
@@ -1099,25 +1101,148 @@ done:
 
 #endif /* HAVE_KRB5 && HAVE_GETGRNAM_R */
 
+static int
+external_acl_check(const struct request *request,
+                   const char *program,
+                   int *rc)
+{
+    int status = -1, i = 0;
+    pid_t pid;
+    struct sigaction sa;
+    char **argv = NULL;
+    int cstatus; 
+    char **pargv = request->argv;
+    size_t countargs = 0;
+    int argv_offset = 1; /* skip first argv cause this is program name */
+
+    if (pargv != NULL) {
+        while (pargv[countargs] != NULL)
+            countargs++;
+
+        if (countargs != 0)
+            if (request->subcommand != NULL) {
+                /* skip subcommand in argv.
+                 * the subcommand is already available through
+                 * REMCTL_SUBCOMMAND env var.
+                 */
+                argv_offset++;
+            }
+    }
+    else
+        countargs = 0;
+
+    /*
+     * Flush output before forking, mostly in case -S was given and we've
+     * therefore been writing log messages to standard output that may not
+     * have been flushed yet.
+     */
+    fflush(stdout);
+    pid = fork();
+    switch(pid) {
+    case -1:
+        syswarn("cannot fork external acl checking program");
+        status = -1;
+        goto done;
+
+    /* In the child */
+    case 0: 
+        close(0);
+        close(1);
+        close(2);
+
+        /*
+         * Restore the default SIGPIPE handler.  The server sets it to
+         * SIG_IGN, which is inherited by children.  We want the child to have
+         * a default set of signal handlers.
+         */
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_DFL;
+        if (sigaction(SIGPIPE, &sa, NULL) < 0)
+            sysdie("cannot clear SIGPIPE handler for external acl checking program");
+
+        if (setenv("REMUSER", request->user, 1) < 0)
+            sysdie("cannot set REMUSER in external acl checking program environment");
+        if (setenv("REMOTE_USER", request->user, 1) < 0)
+            sysdie("cannot set REMOTE_USER in external acl checking program environment");
+        if (setenv("REMCTL_COMMAND", request->command, 1) < 0)
+            sysdie("cannot set REMCTL_COMMAND in external acl checking program environment");
+        if (request->subcommand != NULL)
+            if (setenv("REMCTL_SUBCOMMAND", request->subcommand, 1) < 0)
+                sysdie("cannot set REMCTL_SUBCOMMAND in external acl checking program environment");
+
+        argv = xcalloc(2 + countargs, sizeof(char *));
+        argv[0] = program;
+
+        if (countargs != 0) 
+            /* copy args to external checking program */
+            for (i = argv_offset; i < countargs; i++)
+                argv[1 + i - argv_offset] = pargv[i];
+
+        argv[2 + countargs - argv_offset] = NULL;
+
+        if (execv(program, argv) < 0)
+            sysdie("cannot execute command");
+
+    /* In the parent. */
+    default:
+        
+        /*
+         * Wait for the external ACL checking program to complete
+         */
+        waitpid(pid, &cstatus, 0);
+        if (WIFEXITED(cstatus)) {
+            *rc = WEXITSTATUS(cstatus);
+            status = 0;
+        }
+        else {
+            status = -1;
+        }
+        
+        break;
+    }
+
+done:
+    return status;
+}
+
 /*
  * The ACL check operation for UNIX local group membership.  Takes the user to
  * check, the group of which they have to be a member, and the referencing
  * file name and line number.
  */
-#if 0
 static enum config_status
-acl_check_exec(const char *user, const char *program,
+acl_check_exec(const struct request *request, const char *program,
                const char *file, int lineno)
 {
-
     enum config_status result;
+    int rc = -1;
+    int vrc = -1;
 
-    result = CONFIG_NOMATCH;
+    rc = external_acl_check(request, program, &vrc);
+    if (rc != 0) {
+        warn("%s:%d: external validation script '%s' failed", file,
+             lineno, program);
+        return CONFIG_ERROR;
+    }
 
-done:
+    switch(vrc) {
+    case 0:
+        /* access granted */
+        result = CONFIG_SUCCESS;
+        break;
+
+    case 1:
+        /* checking should continue */
+        result = CONFIG_NOMATCH;
+        break;
+
+    default:
+        /* access denied */
+        result = CONFIG_DENY;
+    }
+
     return result;
 }
-#endif
 
 /*
  * The table relating ACL scheme names to functions.  The first two ACL
@@ -1128,7 +1253,7 @@ static const struct acl_scheme schemes[] = {
     { "file",       acl_check_file       },
     { "princ",      acl_check_princ      },
     { "deny",       acl_check_deny       },
-//    { "exec",       acl_check_exec       },
+    { "exec",       acl_check_exec       },
 #ifdef HAVE_GPUT
     { "gput",       acl_check_gput       },
 #else
