@@ -115,8 +115,10 @@ server_send_summary(struct client *client, struct config *config)
         memset(&process, 0, sizeof(process));
         process.client = client;
         rule = config->rules[i];
+	/*
         if (strcmp(rule->subcommand, "ALL") != 0)
             continue;
+	*/
         if (!server_config_acl_permit(rule, client->user))
             continue;
         if (rule->summary == NULL)
@@ -129,16 +131,28 @@ server_send_summary(struct client *client, struct config *config)
          * argv and pass off to be executed.
          */
         path = rule->program;
-        req_argv = xcalloc(3, sizeof(char *));
+        req_argv = xcalloc(4, sizeof(char *));
         program = strrchr(path, '/');
         if (program == NULL)
             program = path;
         else
             program++;
         req_argv[0] = program;
-        req_argv[1] = rule->summary;
-        req_argv[2] = NULL;
-        process.command = rule->summary;
+
+	if ( (strcmp(rule->subcommand, "EMPTY") == 0)
+	     || (strcmp(rule->subcommand, "ALL") == 0) )
+	{
+		req_argv[1] = rule->summary;
+		req_argv[2] = NULL;
+		process.command = rule->summary;
+	}
+	else {
+		req_argv[1] = rule->summary;
+		req_argv[2] = rule->subcommand;
+		req_argv[3] = NULL;
+		process.command = rule->summary;
+	}
+
         process.argv = req_argv;
         process.rule = rule;
         if (server_process_run(&process)) {
